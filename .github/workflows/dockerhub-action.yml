@@ -1,0 +1,27 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: docker login
+      env:
+        DOCKERHUB_USER : ${{secrets.DOCKERHUB_USER}}
+        DOCKERHUB_PWD: ${{secrets.DOCKERHUB_PWD}}
+      run: |
+        docker login -u $DOCKERHUB_USER -p $DOCKERHUB_PWD 
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --tag mattmajestic/dev-space:latest
+      
+    - name: Docker Push
+      run: docker push mattmajestic/dev-space
