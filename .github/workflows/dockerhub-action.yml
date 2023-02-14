@@ -21,7 +21,7 @@ jobs:
       run: |
         docker login -u $DOCKERHUB_USER -p $DOCKERHUB_PWD 
     - name: Build the Docker image
-      run: docker build . --file .devcontainer/Dockerfile --tag mattmajestic/dev-space:latest .devcontainer/
+      run: docker build . -t mattmajestic/dev-space:latest -f .devcontainer/  
       
     - name: Docker Push
       run: docker push mattmajestic/dev-space
