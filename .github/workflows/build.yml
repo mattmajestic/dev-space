@@ -1,0 +1,280 @@
+name: Build
+on:
+  pull_request:
+    types: [opened, synchronize, edited]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+
+  configuration:
+    name: Configure job parameters
+    runs-on: [self-hosted]
+    concurrency:
+      group: ${{ github.head_ref || github.ref }}-configuration
+      cancel-in-progress: true
+    outputs:
+      is_main_branch: ${{ steps.output.outputs.is_main_branch }}
+      version: ${{ steps.output.outputs.version }}
+      preview_enable: ${{ steps.output.outputs.preview_enable }}
+      preview_infra_provider: ${{ steps.output.outputs.preview_infra_provider }}
+      with_github_actions: ${{ steps.output.outputs.with_github_actions }}
+      build_no_cache: ${{ steps.output.outputs.build_no_cache }}
+      build_no_test: ${{ steps.output.outputs.build_no_test }}
+      build_leeway_target: ${{ steps.output.outputs.build_leeway_target }}
+      with_large_vm: ${{ steps.output.outputs.with_large_vm }}
+      publish_to_npm: ${{ steps.output.outputs.publish_to_npm }}
+      publish_to_jbmp: ${{ steps.output.outputs.publish_to_jbmp }}
+      with_ws_manager_mk2: ${{ steps.output.outputs.with_ws_manager_mk2 }}
+      with_dedicated_emulation: ${{ steps.output.outputs.with_dedicated_emulation }}
+      with_ee_license: ${{ steps.output.outputs.with_ee_license }}
+      with_slow_database: ${{ steps.output.outputs.with_slow_database }}
+      analytics: ${{ steps.output.outputs.analytics }}
+      workspace_feature_flags: ${{ steps.output.outputs.workspace_feature_flags }}
+    steps:
+      - name: "Determine Branch"
+        id: branches
+        uses: transferwise/sanitize-branch-name@v1
+      - name: "Set outputs"
+        id: output
+        env:
+          PR_DESC: '${{ github.event.pull_request.body }}'
+        shell: bash
+        run: |
+          {
+            echo "is_main_branch=${{ (github.head_ref || github.ref) == 'refs/heads/main' }}"
+            echo "version=${{ steps.branches.outputs.sanitized-branch-name }}-gha.${{github.run_number}}"
+            echo "with_github_actions=${{ contains(github.event.pull_request.body, '[x] /werft with-github-actions') }}"
+            echo "preview_enable=${{ contains(github.event.pull_request.body, '[x] /werft with-preview') }}"
+            echo "preview_infra_provider=${{ contains(github.event.pull_request.body, '[X] /werft with-gce-vm') && 'gce' || 'harvester' }}"
+            echo "build_no_cache=${{ contains(github.event.pull_request.body, '[x] leeway-no-cache') }}"
+            echo "build_no_test=${{ contains(github.event.pull_request.body, '[x] /werft no-test') }}"
+            echo "build_leeway_target=$(echo "$PR_DESC" | sed -n -e 's/^.*leeway-target=//p' | sed 's/\r$//')"
+            echo "with_large_vm=${{ contains(github.event.pull_request.body, '[X] /werft with-large-vm') }}"
+            echo "publish_to_npm=${{ contains(github.event.pull_request.body, '[X] /werft publish-to-npm') }}"
+            echo "publish_to_jbmp=${{ contains(github.event.pull_request.body, '[X] /werft publish-to-jb-marketplace') }}"
+            echo "with_ws_manager_mk2=${{ contains(github.event.pull_request.body, '[X] with-ws-manager-mk2') }}"
+            echo "with_dedicated_emulation=${{ contains(github.event.pull_request.body, '[X] with-dedicated-emulation') }}"
+            echo "with_ee_license=${{ contains(github.event.pull_request.body, '[X] with-ee-license') }}"
+            echo "with_slow_database=${{ contains(github.event.pull_request.body, '[X] with-slow-database') }}"
+            echo "analytics=${{ contains(github.event.pull_request.body, '[X] analytics') }}"
+            echo "workspace_feature_flags=$(echo "$PR_DESC" | grep -oP '(?<=\[X\] workspace-feature-flags).*')"
+          } >> $GITHUB_OUTPUT
+
+  build-previewctl:
+    name: Build previewctl
+    needs: [configuration]
+    concurrency:
+      group: ${{ github.head_ref || github.ref }}-build-previewctl
+      # see comment in build-gitpod below for context
+      cancel-in-progress: ${{ needs.configuration.outputs.is_main_branch == 'false' }}
+    runs-on: [self-hosted]
+    container:
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:mads-leeway-v0.7.3.4
+    outputs:
+      previewctl_hash: ${{ steps.build.outputs.previewctl_hash }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Configure workspace
+        run: |
+          sudo chown -R gitpod:gitpod /__t
+          # Needed by docker/login-action
+          sudo chmod goa+rw /var/run/docker.sock
+      - name: Build previewctl
+        id: build
+        shell: bash
+        env:
+          HOME: /home/gitpod
+          PREVIEW_ENV_DEV_SA_KEY: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          # Authenticate with GCP so we can use the Leeway cache
+          export PREVIEW_ENV_DEV_SA_KEY_PATH="$HOME/.config/gcloud/preview-environment-dev-sa.json"
+          echo "${PREVIEW_ENV_DEV_SA_KEY}" > "${PREVIEW_ENV_DEV_SA_KEY_PATH}"
+          gcloud auth activate-service-account --key-file "${PREVIEW_ENV_DEV_SA_KEY_PATH}"
+
+          export LEEWAY_WORKSPACE_ROOT="$(pwd)"
+          leeway build dev/preview/previewctl:docker -Dversion="${{needs.configuration.outputs.version}}"
+          echo "previewctl_hash=$(leeway describe dev/preview/previewctl:docker -Dversion="${{needs.configuration.outputs.version}}" -t '{{ .Metadata.Version }}')" >> $GITHUB_OUTPUT
+
+  infrastructure:
+    needs: [configuration, build-previewctl]
+    if: ${{ needs.configuration.outputs.preview_enable == 'true' && needs.configuration.outputs.with_github_actions == 'true' }}
+    runs-on: [self-hosted]
+    concurrency:
+      group: ${{ github.head_ref || github.ref }}-infrastructure
+    steps:
+      - uses: actions/checkout@v3
+      - name: Create preview environment infrastructure
+        id: create
+        uses: ./.github/actions/preview-create
+        with:
+          name: ${{ github.head_ref || github.ref }}
+          sa_key: ${{ secrets.GCP_CREDENTIALS }}
+          infrastructure_provider: ${{ needs.configuration.outputs.preview_infra_provider }}
+          previewctl_hash: ${{ needs.build-previewctl.outputs.previewctl_hash }}
+          large_vm: ${{ needs.configuration.outputs.with_large_vm }}
+
+  build-gitpod:
+    name: Build Gitpod
+    needs: [configuration]
+    if: ${{ needs.configuration.outputs.is_main_branch == 'true' || needs.configuration.outputs.with_github_actions == 'true' }}
+    runs-on: [self-hosted]
+    concurrency:
+      group: ${{ github.head_ref || github.ref }}-build-gitpod
+      # For the main branch we always want the build job to run to completion
+      # For other branches we only care about the "latest" version, so it is fine to cancel in-progress builds
+      cancel-in-progress: ${{ needs.configuration.outputs.is_main_branch == 'false' }}
+    services:
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_TCP_PORT: 23306
+    container:
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:mads-leeway-v0.7.3.4
+      env:
+        DB_HOST: mysql
+    steps:
+      - uses: actions/checkout@v3
+      - name: Configure workspace
+        run: |
+          cp -r /__w/gitpod/gitpod /workspace
+          # Needed by google-github-actions/setup-gcloud
+          sudo chown -R gitpod:gitpod /__t
+          # Needed by docker/login-action
+          sudo chmod goa+rw /var/run/docker.sock
+      - id: auth
+        uses: google-github-actions/auth@v1
+        with:
+          token_format: access_token
+          credentials_json: "${{ secrets.GCP_CREDENTIALS }}"
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+      - uses: docker/login-action@v2
+        with:
+          registry: eu.gcr.io
+          username: oauth2accesstoken
+          password: "${{ steps.auth.outputs.access_token }}"
+      - name: Leeway Vet
+        shell: bash
+        working-directory: /workspace/gitpod
+        run: |
+          leeway vet --ignore-warnings
+      - name: Pre-Commit Checks
+        shell: bash
+        working-directory: /workspace/gitpod
+        run: |
+          RESULT=0
+          pre-commit run --show-diff-on-failure || RESULT=$?
+          if [ $RESULT -ne 0 ]; then
+            echo "::error title=The Pre-Commit Checks Failed.::Please run 'pre-commit run --show-diff-on-failure'"
+          fi
+          exit "$RESULT"
+      - name: Check License Headers
+        shell: bash
+        working-directory: /workspace/gitpod
+        run: |
+          RESULT=0
+          LICENCE_HEADER_CHECK_ONLY=true leeway run components:update-license-header || RESULT=$?
+          if [ $RESULT -ne 0 ]; then
+            echo "::error title=There are some license headers missing.::Please run 'leeway run components:update-license-header'"
+          fi
+          exit "$RESULT"
+      - name: Get Secrets from GCP
+        id: 'secrets'
+        uses: 'google-github-actions/get-secretmanager-secrets@v1'
+        with:
+          secrets: |-
+            segment-io-token:gitpod-core-dev/segment-io-token
+            npm-auth-token:gitpod-core-dev/npm-auth-token
+            jb-marketplace-publish-token:gitpod-core-dev/jb-marketplace-publish-token
+            codecov-token:gitpod-core-dev/codecov
+      - name: Leeway Build
+        id: leeway
+        shell: bash
+        working-directory: /workspace/gitpod
+        env:
+          JAVA_HOME: /home/gitpod/.sdkman/candidates/java/current
+          VERSION: ${{needs.configuration.outputs.version}}
+          SEGMENT_IO_TOKEN: '${{ steps.secrets.outputs.segment-io-token }}'
+          PR_NO_CACHE: ${{needs.configuration.outputs.build_no_cache}}
+          PR_NO_TEST: ${{needs.configuration.outputs.build_no_test}}
+          PR_LEEWAY_TARGET: ${{needs.configuration.outputs.build_leeway_target}}
+          NPM_AUTH_TOKEN: '${{ steps.secrets.outputs.npm-auth-token }}'
+          PUBLISH_TO_NPM: ${{ needs.configuration.outputs.publish_to_npm == 'true' }}
+          JB_MARKETPLACE_PUBLISH_TOKEN: '${{ steps.secrets.outputs.jb-marketplace-publish-token }}'
+          PUBLISH_TO_JBPM: ${{ needs.configuration.outputs.publish_to_jbmp == 'true' }}
+          CODECOV_TOKEN: '${{ steps.secrets.outputs.codecov-token }}'
+        run: |
+          [[ "$PR_NO_CACHE" = "true" ]] && CACHE="none"       || CACHE="remote"
+          [[ "$PR_NO_TEST"  = "true" ]] && TEST="--dont-test" || TEST=""
+          [[ -z "$PR_LEEWAY_TARGET" ]] && PR_LEEWAY_TARGET="components:all"
+          [[ "${PUBLISH_TO_NPM}" = 'true' ]] && NPM_PUBLISH_TRIGGER=$(date +%s%3N) || NPM_PUBLISH_TRIGGER="false"
+
+          mkdir -p /__w/gitpod/gitpod/test-coverage-report
+
+          RESULT=0
+          set -x
+          leeway build $PR_LEEWAY_TARGET \
+            --cache $CACHE \
+            $TEST \
+            -Dversion=$VERSION \
+            -DlocalAppVersion=$VERSION \
+            -DSEGMENT_IO_TOKEN=$SEGMENT_IO_TOKEN \
+            -DpublishToNPM="${PUBLISH_TO_NPM}" \
+            -DnpmPublishTrigger="${NPM_PUBLISH_TRIGGER}" \
+            -DpublishToJBMarketplace="${PUBLISH_TO_JBPM}" \
+            --coverage-output-path=/__w/gitpod/gitpod/test-coverage-report \
+            --report report.html || RESULT=$?
+          set +x
+
+          cat report.html >> $GITHUB_STEP_SUMMARY
+          exit $RESULT
+      - name: "Upload Test Coverage Report"
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-coverage-report
+          if-no-files-found: ignore
+          path: |
+            test-coverage-report
+
+  install:
+    name: "Install Gitpod"
+    needs: [configuration, build-previewctl, build-gitpod, infrastructure]
+    runs-on: [self-hosted]
+    concurrency:
+      group: ${{ github.head_ref || github.ref }}-install
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v3
+      - name: Deploy Gitpod to the preview environment
+        id: deploy-gitpod
+        uses: ./.github/actions/deploy-gitpod
+        with:
+          name: ${{ github.head_ref || github.ref }}
+          version: ${{needs.configuration.outputs.version}}
+          sa_key: ${{ secrets.GCP_CREDENTIALS }}
+          previewctl_hash: ${{ needs.build-previewctl.outputs.previewctl_hash }}
+          with_ws_manager_mk2: ${{needs.configuration.outputs.with_ws_manager_mk2}}
+          with_dedicated_emulation: ${{needs.configuration.outputs.with_dedicated_emulation}}
+          with_ee_license: ${{needs.configuration.outputs.with_ee_license}}
+          with_slow_database: ${{needs.configuration.outputs.with_slow_database}}
+          analytics: ${{needs.configuration.outputs.analytics}}
+          workspace_feature_flags: ${{needs.configuration.outputs.workspace_feature_flags}}
+
+  monitoring:
+    name: "Install Monitoring Satellite"
+    needs: [infrastructure, build-previewctl]
+    runs-on: [self-hosted]
+    concurrency:
+      group: ${{ github.head_ref || github.ref }}-monitoring
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v3
+      - name: Deploy monitoring satellite to the preview environment
+        id: deploy-monitoring-satellite
+        uses: ./.github/actions/deploy-monitoring-satellite
+        with:
+          sa_key: ${{ secrets.GCP_CREDENTIALS }}
+          previewctl_hash: ${{ needs.build-previewctl.outputs.previewctl_hash }}
